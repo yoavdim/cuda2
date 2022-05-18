@@ -6,7 +6,7 @@
 #define IMG_TILES (TILE_COUNT*TILE_COUNT)
 #define MAP_SIZE (IMG_TILES*256)
 #define THREAD_NUM 1024
-#define NO_ID 0
+#define NO_ID -1
 
 __device__ void prefix_sum(int arr[256], int arr_size) {
     int tid = threadIdx.x;
@@ -138,9 +138,9 @@ public:
     ~streams_server() override
     {
         for(int i=0; i<STREAM_COUNT; i++) {
-            cudaFree(context[i].d_image_in);
-            cudaFree(context[i].d_image_out);
-            cudaFree(context[i].d_maps);
+            cudaFree(contexts[i].d_image_in);
+            cudaFree(contexts[i].d_image_out);
+            cudaFree(contexts[i].d_maps);
 
             cudaStreamDestroy(streams[i]);
         }
@@ -154,11 +154,13 @@ public:
             // check empty
             if(ids[s] != NO_ID)
                 continue;
+            ids[s] = img_id;
+	    //CUDA_CHECK(cudaStreamQuery(streams[s])); // debug only
             // start
             CUDA_CHECK(cudaMemcpyAsync(contexts[s].d_image_in, img_in, IMG_SIZE, cudaMemcpyHostToDevice, streams[s]));
             process_image_kernel<<<1,THREAD_NUM,0,streams[s]>>>(contexts[s].d_image_in, contexts[s].d_image_out, contexts[s].d_maps); 
             CUDA_CHECK(cudaMemcpyAsync(img_out, contexts[s].d_image_out, IMG_SIZE, cudaMemcpyDeviceToHost, streams[s]));
-            ids[s] = img_id;
+	    //printf("queued\n");
             return true;
         }
         return false;
@@ -166,7 +168,6 @@ public:
 
     bool dequeue(int *img_id) override
     {
-        return false;
 
         // TODO query (don't block) streams for any completed requests.
         for( int s=0; s<STREAM_COUNT; s++) {
@@ -178,6 +179,7 @@ public:
                 // TODO return the img_id of the request that was completed.
                 *img_id = ids[s];
                 ids[s] = NO_ID; // mark for reuse
+		//printf("dequeued %d @ %d\n", *img_id, s);
                 return true;
             case cudaErrorNotReady:
                 break; // and continue loop
@@ -196,6 +198,9 @@ std::unique_ptr<image_processing_server> create_streams_server()
 }
 
 // TODO implement a lock
+// only in gpu
+
+
 // TODO implement a MPMC queue
 // TODO implement the persistent kernel
 // TODO implement a function for calculating the threadblocks count
