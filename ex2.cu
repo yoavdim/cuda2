@@ -67,7 +67,7 @@ __device__ void process_image(uchar *all_in, uchar *all_out, uchar *maps) {
 
     for (int index = tid; index < IMG_SIZE; index += tnum) { // calc histograms
 	int tile = get_tile_id(index);
-	uchar pix_val = all_in[IMG_SIZE*bid + index];
+	uchar pix_val = all_in[index];
 	int *hist = &(histograms[tile][pix_val]);
         atomicAdd(hist, 1);
     }
@@ -94,11 +94,11 @@ __device__ void process_image(uchar *all_in, uchar *all_out, uchar *maps) {
         int cdf = ((int*) histograms)[i];
 //        maps[MAP_SIZE*bid + i] = (uchar) ((((double)cdf)*255)/(TILE_WIDTH*TILE_HEIGHT)); // cast will round down
 	    uchar map_value =(((double)cdf) / (TILE_WIDTH*TILE_HEIGHT)) * 255;
-	    maps[MAP_SIZE*bid + i] = map_value;
+	    maps[i] = map_value;
     }
     __syncthreads();
 
-    interpolate_device(maps + MAP_SIZE*bid, all_in + IMG_SIZE * bid, all_out + IMG_SIZE * bid);
+    interpolate_device(maps, all_in, all_out);
 
     __syncthreads();
 }
@@ -220,19 +220,23 @@ private:
     T *_mailbox;
     cuda::atomic<size_t> _head, _tail;
     gpu_atomic_int *_lock; // in device memory
-    int terminate; // release all threads (assigned once & no need to lock)
 public:
+    int *terminate; // release all threads (assigned once & no need to lock)
 
-    ring_buffer(size_t n) : _head(0), _tail(0), terminate(0) {
+
+    ring_buffer(size_t n) : _head(0), _tail(0) {
         N = n; // must be a power of 2
         cudaMallocHost(&_mailbox, N*sizeof(T));
+	cudaMallocHost(&terminate, sizeof(int));
+	*terminate = 0;
 
         CUDA_CHECK(cudaMalloc(&_lock, sizeof(gpu_atomic_int)));
-        init_lock<<<1,1>>(_lock);
+        init_lock<<<1,1>>>(_lock);
         CUDA_CHECK(cudaDeviceSynchronize());
     }
     ~ring_buffer() {
         cudaFreeHost(_mailbox);
+	cudaFreeHost(terminate);
 
         destroy_lock<<<1,1>>>(_lock);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -241,19 +245,19 @@ public:
 
     __device__ __host__ int push(const T &data, int abort=0) {
         // abort on fail option for cpu side
-        int tail = _tail.load(memory_order_relaxed);
-        while (tail - _head.load(memory_order_acquire) == N  && !terminate && !abort);
-        if(terminate ||  tail - _head.load(memory_order_acquire) == N) return 0;
+        int tail = _tail.load(cuda::memory_order_relaxed);
+        while (tail - _head.load(cuda::memory_order_acquire) == N  && !*terminate && !abort);
+        if(*terminate ||  tail - _head.load(cuda::memory_order_acquire) == N) return 0;
         _mailbox[_tail % N] = data;
-        _tail.store(tail + 1, memory_order_release);
-        return 1
+        _tail.store(tail + 1, cuda::memory_order_release);
+        return 1;
     }
     __device__ __host__ int pop( T* result, int abort=0) {
-        int head = _head.load(memory_order_relaxed);
-        while (_tail.load(memory_order_acquire) == _head  && !terminate && !abort);
-        if(terminate ||  _tail.load(memory_order_acquire) == _head) return 0;
+        int head = _head.load(cuda::memory_order_relaxed);
+        while (_tail.load(cuda::memory_order_acquire) == _head  && !*terminate && !abort);
+        if(*terminate ||  _tail.load(cuda::memory_order_acquire) == _head) return 0;
         *result = _mailbox[_head % N];
-        _head.store(head + 1, memory_order_release);
+        _head.store(head + 1, cuda::memory_order_release);
         return 1;
     }
 
@@ -289,9 +293,9 @@ __global__ void run_cores(ring_buffer<task_info> *buffer_in, ring_buffer<int> *b
     while(true) {
         if(tid == 0) task = buffer_in->gpu_pop(); 
         __syncthreads(); // only 1 thread in block need to access lock
-        if(buffer_in->terminate) {
+        if(*(buffer_in->terminate)) {
             if(tid == 0) // reduce number of pcie writes
-                buffer_out->terminate = 1; 
+                buffer_out->terminate[0] = 1; 
             return; 
         } 
         process_image(task.d_image_in, task.d_image_out, d_maps + MAP_SIZE*bid);
@@ -302,7 +306,7 @@ __global__ void run_cores(ring_buffer<task_info> *buffer_in, ring_buffer<int> *b
 
 // TODO implement a function for calculating the threadblocks count
 int calc_tb() {
-    return 64; // TODO implement
+    return 128; // TODO implement
 }
 
 // -------
@@ -336,8 +340,8 @@ public:
     ~queue_server() override
     {
         // TODO free resources allocated in constructor
-        buffer_in->terminate = 1;
-        buffer_out->terminate = 1; // just in case
+        buffer_in->terminate[0] = 1;
+        buffer_out->terminate[0] = 1; // just in case
         CUDA_CHECK(cudaDeviceSynchronize());
         buffer_in->~ring_buffer();
         buffer_out->~ring_buffer();
@@ -359,7 +363,9 @@ public:
     bool dequeue(int *img_id) override
     {
         // TODO query (don't block) the producer-consumer queue for any responses.
-        return buffer_out->pop(&img_id, 1);
+        int status = buffer_out->pop(img_id, 1);
+	// if (status) printf("next\n");
+	return status;
     }
 };
 
