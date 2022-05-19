@@ -1,4 +1,5 @@
 #include "ex2.h"
+#include <new>
 #include <cuda/atomic>
 
 #define IMG_SIZE (IMG_HEIGHT*IMG_WIDTH)
@@ -197,44 +198,168 @@ std::unique_ptr<image_processing_server> create_streams_server()
     return std::make_unique<streams_server>();
 }
 
-// TODO implement a lock
-// only in gpu
+// implement a lock
+// only in gpu, different for in and out
+
+typedef cuda::atomic<int, cuda::thread_scope_device> gpu_atomic_int;
+__global__ void init_lock(gpu_atomic_int* _lock) { new(_lock) gpu_atomic_int(0); }
+__global__ void destroy_lock(gpu_atomic_int* _lock) {_lock->~gpu_atomic_int(); }
+
+__device__ void lock(gpu_atomic_int *l) {
+    while(l->exchange(1, cuda::memory_order_relaxed));
+    cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_device);
+}
+__device__ void unlock(gpu_atomic_int *l) {
+    l->store(0, cuda::memory_order_release);
+}
+
+// implement a MPMC queue - not single one
+template <class T> class ring_buffer {
+private:
+    size_t N;
+    T *_mailbox;
+    cuda::atomic<size_t> _head, _tail;
+    gpu_atomic_int *_lock; // in device memory
+    int terminate; // release all threads (assigned once & no need to lock)
+public:
+
+    ring_buffer(size_t n) : _head(0), _tail(0), terminate(0) {
+        N = n; // must be a power of 2
+        cudaMallocHost(&_mailbox, N*sizeof(T));
+
+        CUDA_CHECK(cudaMalloc(&_lock, sizeof(gpu_atomic_int)));
+        init_lock<<<1,1>>(_lock);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    ~ring_buffer() {
+        cudaFreeHost(_mailbox);
+
+        destroy_lock<<<1,1>>>(_lock);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        cudaFree(_lock);
+    }
+
+    __device__ __host__ int push(const T &data, int abort=0) {
+        // abort on fail option for cpu side
+        int tail = _tail.load(memory_order_relaxed);
+        while (tail - _head.load(memory_order_acquire) == N  && !terminate && !abort);
+        if(terminate ||  tail - _head.load(memory_order_acquire) == N) return 0;
+        _mailbox[_tail % N] = data;
+        _tail.store(tail + 1, memory_order_release);
+        return 1
+    }
+    __device__ __host__ int pop( T* result, int abort=0) {
+        int head = _head.load(memory_order_relaxed);
+        while (_tail.load(memory_order_acquire) == _head  && !terminate && !abort);
+        if(terminate ||  _tail.load(memory_order_acquire) == _head) return 0;
+        *result = _mailbox[_head % N];
+        _head.store(head + 1, memory_order_release);
+        return 1;
+    }
+
+    __device__ T gpu_pop() {
+        lock(_lock);
+        T res;
+        pop(&res);
+        unlock(_lock);
+        return res;
+    }
+
+    __device__ void gpu_push(const T& data) {
+        lock(_lock);
+        push(data);
+        unlock(_lock);
+    }
+};
+
+struct task_info {
+    uchar *d_image_in;
+    uchar *d_image_out;
+    int id;
+    //uchar *d_maps; 
+};
 
 
-// TODO implement a MPMC queue
-// TODO implement the persistent kernel
+// TODO implement the persistent kernel each tb is a different calculator (remember the use of barriers)
+__global__ void run_cores(ring_buffer<task_info> *buffer_in, ring_buffer<int> *buffer_out, uchar *d_maps) {
+    __shared__ task_info task;
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    
+    while(true) {
+        if(tid == 0) task = buffer_in->gpu_pop(); 
+        __syncthreads(); // only 1 thread in block need to access lock
+        if(buffer_in->terminate) {
+            if(tid == 0) // reduce number of pcie writes
+                buffer_out->terminate = 1; 
+            return; 
+        } 
+        process_image(task.d_image_in, task.d_image_out, d_maps + MAP_SIZE*bid);
+        if(tid == 0) buffer_out->gpu_push(task.id);
+        // no need to sync. will wait in the next cycle
+    }
+}
+
 // TODO implement a function for calculating the threadblocks count
+int calc_tb() {
+    return 64; // TODO implement
+}
 
+// -------
 class queue_server : public image_processing_server
 {
 private:
     // TODO define queue server context (memory buffers, etc...)
+    ring_buffer<task_info> *buffer_in;
+    ring_buffer<int>       *buffer_out; // pinned
+    uchar *maps; 
+
 public:
     queue_server(int threads)
     {
-        // TODO initialize host state
+        int tb_num = calc_tb();
+        char *temp;
+        // initialize host state
+        // maps:
+        cudaMallocHost(&maps, MAP_SIZE*tb_num*sizeof(uchar));
+        // in:
+        cudaMallocHost(&temp, sizeof(ring_buffer<task_info>));
+        buffer_in = new(temp) ring_buffer<task_info>(64*tb_num);
+        // out:
+        cudaMallocHost(&temp, sizeof(ring_buffer<int>));
+        buffer_out = new(temp) ring_buffer<int>(64*tb_num);
+
         // TODO launch GPU persistent kernel with given number of threads, and calculated number of threadblocks
+        run_cores<<<tb_num, threads>>>(buffer_in, buffer_out, maps);
     }
 
     ~queue_server() override
     {
         // TODO free resources allocated in constructor
+        buffer_in->terminate = 1;
+        buffer_out->terminate = 1; // just in case
+        CUDA_CHECK(cudaDeviceSynchronize());
+        buffer_in->~ring_buffer();
+        buffer_out->~ring_buffer();
+        cudaFreeHost(buffer_in);
+        cudaFreeHost(buffer_out);
+        cudaFreeHost(maps);
     }
 
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
     {
         // TODO push new task into queue if possible
-        return false;
+        task_info task;
+        task.d_image_in = img_in;
+        task.d_image_out = img_out;
+        task.id = img_id;
+        return buffer_in->push(task, 1);
     }
 
     bool dequeue(int *img_id) override
     {
         // TODO query (don't block) the producer-consumer queue for any responses.
-        return false;
-
-        // TODO return the img_id of the request that was completed.
-        //*img_id = ... 
-        return true;
+        return buffer_out->pop(&img_id, 1);
     }
 };
 
