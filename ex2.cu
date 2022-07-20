@@ -309,15 +309,14 @@ __global__ void run_cores(ring_buffer<task_info> *buffer_in, ring_buffer<int> *b
 // TODO implement a function for calculating the threadblocks count
 #define MIN(a,b) ( ((a)<(b)) ? (a) : (b) )
 int calc_tb() {
-	int limit_shared, limit_threads, limit_regs;
-	int tb;
+	float limit_shared, limit_threads, limit_regs;
 
 	cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0)); // 0 = device_number?
     
-    limit_shared  = prop.sharedMemPerBlock  / SHARED_USAGE; 
-    limit_threads = prop.maxThreadsPerBlock / THREAD_NUM;
-    limit_regs    = prop.regsPerBlock       / (THREAD_NUM * REG_NUM);
+    limit_shared  = prop.multiProcessorCount * prop.sharedMemPerBlock  / SHARED_USAGE; 
+    limit_threads = prop.multiProcessorCount * prop.maxThreadsPerBlock / THREAD_NUM;
+    limit_regs    = prop.multiProcessorCount * prop.regsPerBlock       / (THREAD_NUM * REG_NUM);
     return MIN( limit_shared, MIN( limit_threads, limit_regs ) );
 }
 
