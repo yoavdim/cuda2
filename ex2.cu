@@ -8,6 +8,8 @@
 #define MAP_SIZE (IMG_TILES*256)
 #define THREAD_NUM 1024
 #define NO_ID -1
+#define REG_NUM 32
+#define SHARED_USAGE (1024 + 4*256*IMG_TILES)
 
 __device__ void prefix_sum(int arr[256], int arr_size) {
     int tid = threadIdx.x;
@@ -305,8 +307,19 @@ __global__ void run_cores(ring_buffer<task_info> *buffer_in, ring_buffer<int> *b
 }
 
 // TODO implement a function for calculating the threadblocks count
+#define MIN(a,b) ( ((a)<(b)) ? (a) : (b) )
 int calc_tb() {
-    return 128; // TODO implement
+    return 128;
+	int limit_shared, limit_threads, limit_regs;
+	int tb;
+
+	cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0)); // 0 = device_number?
+    
+    limit_shared  = prop.sharedMemPerMultiProcessor  / SHARED_USAGE; 
+    limit_threads = prop.maxThreadsPerMultiProcessor / THREAD_NUM;
+    limit_regs    = prop.regsPerMultiProcessor       / (THREAD_NUM * REG_NUM);
+    return MIN( limit_shared, MIN( limit_threads, limit_regs ) );
 }
 
 // -------
